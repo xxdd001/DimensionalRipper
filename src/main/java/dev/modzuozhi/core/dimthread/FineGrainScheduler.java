@@ -6,7 +6,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
 
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
+import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -130,7 +130,6 @@ public final class FineGrainScheduler {
      * {@link #submit} 直接在当前线程同步执行，保证开关无关的正确性。
      */
     public static final class Barrier {
-        private final CountDownLatch latch = new CountDownLatch(1);
         private final PostExecuteQueue postQueue = new PostExecuteQueue();
         private int pending;
 
@@ -202,7 +201,7 @@ public final class FineGrainScheduler {
                     synchronized (this) {
                         pending--;
                         if (pending == 0) {
-                            latch.countDown();
+                            this.notifyAll();
                         }
                     }
                     ACTIVE_SUBTASKS.decrementAndGet();
@@ -211,48 +210,53 @@ public final class FineGrainScheduler {
         }
 
         /**
-         * 批量提交待并行实体（借鉴 Async 批量化思路，独立实现）。
+         * 按实体所在区块分组提交待并行实体（问题1 架构项：实体并行的互斥粒度细化到「区块」）。
          * <p>
-         * 按线程池大小把实体列表切成块，每块作为一个子任务提交并行执行，把调度/屏障计数
-         * 开销从 O(实体数) 降到 O(线程数)。块内逐实体 tick 并保持异常隔离。
+         * 原实现把实体列表按线程池大小切块，一个块可能包含<b>不同区块</b>的实体，它们在
+         * 不同子任务线程并发 tick 时可能<b>并发写同一区块</b>的方块/实体容器（fastutil/ArrayList
+         * 并发损坏）。这里改为：<b>同区块实体放入同一子任务串行 tick</b>（天然互斥写同一区块），
+         * 不同区块的子任务并行执行；每个子任务持本区块 {@link ChunkLock}，与同区块的方块实体/
+         * 区块环境子任务互斥。既消除「多 worker 同时写一个 chunk」，又保留跨区块的并行度。
          *
-         * @param server  当前服务器
-         * @param entities 待并行实体列表
+         * @param server   当前服务器
+         * @param byChunk  按实体所在区块分组的映射（chunkKey → 同区块实体列表）
          * @param consumer 实体 tick 函数（如 {@code tickNonPassenger}）
          */
-        public void submitBatch(MinecraftServer server, List<Entity> entities, Consumer<Entity> consumer) {
-            if (entities.isEmpty()) {
+        public void submitByChunk(MinecraftServer server, Map<Long, List<Entity>> byChunk, Consumer<Entity> consumer) {
+            if (byChunk.isEmpty()) {
                 return;
             }
             if (!FineGrainScheduler.enabled) {
                 // 细粒度关闭：当前线程逐实体串行 tick（行为等价原版）
-                for (Entity entity : entities) {
-                    if (!entity.isRemoved()) {
-                        consumer.accept(entity);
+                for (List<Entity> entities : byChunk.values()) {
+                    for (Entity entity : entities) {
+                        if (!entity.isRemoved()) {
+                            consumer.accept(entity);
+                        }
                     }
                 }
                 return;
             }
-            int poolSize = SUB_POOL.getCorePoolSize();
-            int chunkSize = Math.max(1, (entities.size() + poolSize - 1) / poolSize);
-            int chunkCount = (entities.size() + chunkSize - 1) / chunkSize;
             synchronized (this) {
-                pending += chunkCount;
+                pending += byChunk.size();
             }
-            ACTIVE_SUBTASKS.addAndGet(chunkCount);
-            for (int i = 0; i < entities.size(); i += chunkSize) {
-                int end = Math.min(i + chunkSize, entities.size());
-                List<Entity> chunk = entities.subList(i, end);
-                SUB_POOL.execute(() -> modzuozhi_runChunk(chunk, consumer));
+            ACTIVE_SUBTASKS.addAndGet(byChunk.size());
+            for (Map.Entry<Long, List<Entity>> entry : byChunk.entrySet()) {
+                long chunkKey = entry.getKey();
+                List<Entity> entities = entry.getValue();
+                int chunkX = (int) (chunkKey >> 32);
+                int chunkZ = (int) (chunkKey & 0xFFFFFFFFL);
+                SUB_POOL.execute(() -> modzuozhi_runChunkByChunk(chunkX, chunkZ, entities, consumer));
             }
         }
 
-        /** 块内逐实体 tick：单实体异常隔离（等价原逐实体提交语义），异常计入 FaultGuard。 */
-        private void modzuozhi_runChunk(List<Entity> chunk, Consumer<Entity> consumer) {
+        /** 单区块组子任务：持本区块锁，组内实体串行 tick，单实体异常隔离。 */
+        private void modzuozhi_runChunkByChunk(int chunkX, int chunkZ, List<Entity> entities, Consumer<Entity> consumer) {
             PostExecuteQueue prev = CURRENT_QUEUE.get();
             CURRENT_QUEUE.set(postQueue);
-            try {
-                for (Entity entity : chunk) {
+            // 持本区块锁：与同区块的 TE/区块环境子任务互斥写同一区块的方块/实体容器
+            try (AutoCloseable chunkLock = ChunkLock.lock(chunkX, chunkZ)) {
+                for (Entity entity : entities) {
                     try {
                         if (!entity.isRemoved()) {
                             consumer.accept(entity);
@@ -262,37 +266,48 @@ public final class FineGrainScheduler {
                         FaultGuard.onSubTaskFailure();
                     }
                 }
+            } catch (Exception ignore) {
+                // 区块锁释放异常：忽略（不影响实体 tick）
             } finally {
                 CURRENT_QUEUE.set(prev);
                 synchronized (this) {
                     pending--;
                     if (pending == 0) {
-                        latch.countDown();
+                        this.notifyAll();
                     }
                 }
                 ACTIVE_SUBTASKS.decrementAndGet();
             }
         }
 
-        /** 阻塞等待本维度所有已提交子任务完成；超时触发 FaultGuard 降级，避免永久死锁。 */
+        /**
+         * 阻塞等待本维度所有已提交子任务完成；超时触发 FaultGuard 降级，避免永久死锁。
+         * <p>
+         * 用 {@code synchronized + wait/notify}（而非一次性 {@code CountDownLatch}）：
+         * 原实现里任务可能在「循环内边提交边完成」——前面任务先完成使 latch 永久归零，
+         * 之后再提交的任务在 await 时无法被等待（CountDownLatch 归零后不能重开），导致
+         * 子任务未完成 worker 就继续执行 → 竞态（高危场景：TE/区块环境循环逐任务提交）。
+         * 改用 {@code while (pending > 0) wait()} 后，无论任务何时完成都会 {@code notifyAll}，
+         * await 一直等到当前 pending 归零，语义正确且仍保留超时降级。
+         */
         public void await() {
-            // 关键：若从未提交任何子任务（pending==0），latch 永远不会 countDown，
-            // 无条件 await 会永久死锁。因此先检查 pending，为 0 直接返回。
             synchronized (this) {
-                if (pending == 0) {
-                    return;
+                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AWAIT_TIMEOUT_MS);
+                while (pending > 0) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        ModZuozhi.LOGGER.error("[FineGrain] 子任务屏障等待超时（>{}ms），存在卡死的子任务，触发降级", AWAIT_TIMEOUT_MS);
+                        FaultGuard.onBarrierTimeout();
+                        return;
+                    }
+                    try {
+                        // wait 最小粒度毫秒；剩余不足 1ms 也按 1ms 等待，由 while 复查
+                        this.wait(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
-            }
-            boolean done;
-            try {
-                done = latch.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-            if (!done) {
-                ModZuozhi.LOGGER.error("[FineGrain] 子任务屏障等待超时（>{}ms），存在卡死的子任务，触发降级", AWAIT_TIMEOUT_MS);
-                FaultGuard.onBarrierTimeout();
             }
         }
 

@@ -2,11 +2,14 @@ package dev.modzuozhi.core.dimthread;
 
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.ChunkPos;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
@@ -139,13 +142,15 @@ public final class EntityTickParallel {
 
     /**
      * 本 tick 收集的一批待并行实体（同一 consumer，即 {@code tickNonPassenger}）。
-     * 收集代替逐实体提交：循环结束后统一按线程池大小切成块提交，把每实体一次的
-     * 调度/屏障计数开销从 O(实体数) 降到 O(线程数)。
+     * 收集代替逐实体提交：循环结束后按<b>实体所在区块分组</b>统一提交（同区块实体一个
+     * 子任务串行 tick，跨区块并行），把每实体一次的调度/屏障计数开销从 O(实体数)
+     * 降到 O(区块数)，并把实体并行的互斥粒度细化到「区块」（问题1 架构项）。
      */
     public static final class Batch {
         public final MinecraftServer server;
         public final Consumer<Entity> consumer;
-        public final List<Entity> entities = new ArrayList<>();
+        /** 按实体所在区块分组：chunkKey → 同区块实体列表（同区块串行 tick，跨区块并行）。 */
+        public final Map<Long, List<Entity>> byChunk = new HashMap<>();
 
         public Batch(MinecraftServer server, Consumer<Entity> consumer) {
             this.server = server;
@@ -160,7 +165,8 @@ public final class EntityTickParallel {
             batch = new Batch(server, consumer);
             BATCH.set(batch);
         }
-        batch.entities.add(entity);
+        long chunkKey = ChunkPos.asLong(entity.getBlockX() >> 4, entity.getBlockZ() >> 4);
+        batch.byChunk.computeIfAbsent(chunkKey, k -> new ArrayList<>()).add(entity);
     }
 
     /** 实体循环开始：为本维度 tick 建立实体子任务屏障（仅 worker 线程调用）。 */
@@ -180,8 +186,8 @@ public final class EntityTickParallel {
         CURRENT.remove();
         Batch batch = BATCH.get();
         BATCH.remove();
-        if (batch != null && !batch.entities.isEmpty()) {
-            barrier.submitBatch(batch.server, batch.entities, batch.consumer);
+        if (batch != null && !batch.byChunk.isEmpty()) {
+            barrier.submitByChunk(batch.server, batch.byChunk, batch.consumer);
         }
         barrier.await();
         barrier.drain();
