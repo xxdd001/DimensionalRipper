@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -212,11 +213,13 @@ public final class FineGrainScheduler {
         /**
          * 按实体所在区块分组提交待并行实体（问题1 架构项：实体并行的互斥粒度细化到「区块」）。
          * <p>
-         * 原实现把实体列表按线程池大小切块，一个块可能包含<b>不同区块</b>的实体，它们在
-         * 不同子任务线程并发 tick 时可能<b>并发写同一区块</b>的方块/实体容器（fastutil/ArrayList
-         * 并发损坏）。这里改为：<b>同区块实体放入同一子任务串行 tick</b>（天然互斥写同一区块），
-         * 不同区块的子任务并行执行；每个子任务持本区块 {@link ChunkLock}，与同区块的方块实体/
-         * 区块环境子任务互斥。既消除「多 worker 同时写一个 chunk」，又保留跨区块的并行度。
+         * <b>v1.1.1 修复（性能回退回归）</b>：v1.1.0 把每个含实体的区块各提交一个子任务并持
+         * {@link ChunkLock}，实体大量分散在多区块时子任务数从 O(线程数) 暴涨到 O(区块数)，叠加
+         * 屏障 monitor / {@code ChunkLock} 锁表竞争与负载不均，TPS 从 20 掉到 ~8（实测对比 v1.0.0）。
+         * 这里保留「同区块实体放入同一组串行 tick」（天然互斥写同一区块），但把各区块组
+         * <b>合并成与线程池大小相当的批次</b>提交：子任务数回到 O(线程数)，负载均衡，恢复
+         * v1.0.0 的调度开销；同时<b>不再持 {@link ChunkLock}</b>——同区块实体已在同一子任务内
+         * 串行，组间若真跨区块写则 radius=0 的旧锁也保护不了，且 v1.0.0 无锁实测稳定。
          *
          * @param server   当前服务器
          * @param byChunk  按实体所在区块分组的映射（chunkKey → 同区块实体列表）
@@ -237,37 +240,44 @@ public final class FineGrainScheduler {
                 }
                 return;
             }
-            synchronized (this) {
-                pending += byChunk.size();
+            // 把区块组列表均分到 ~poolSize 个批次（同区块实体不拆开，保持组内串行）。
+            List<Map.Entry<Long, List<Entity>>> entries = new ArrayList<>(byChunk.entrySet());
+            int poolSize = Math.max(1, SUB_POOL.getCorePoolSize());
+            int batchCount = Math.min(entries.size(), poolSize);
+            int perBatch = Math.max(1, (entries.size() + batchCount - 1) / batchCount);
+            List<List<Map.Entry<Long, List<Entity>>>> batches = new ArrayList<>(batchCount);
+            for (int i = 0; i < entries.size(); i += perBatch) {
+                batches.add(entries.subList(i, Math.min(i + perBatch, entries.size())));
             }
-            ACTIVE_SUBTASKS.addAndGet(byChunk.size());
-            for (Map.Entry<Long, List<Entity>> entry : byChunk.entrySet()) {
-                long chunkKey = entry.getKey();
-                List<Entity> entities = entry.getValue();
-                int chunkX = (int) (chunkKey >> 32);
-                int chunkZ = (int) (chunkKey & 0xFFFFFFFFL);
-                SUB_POOL.execute(() -> modzuozhi_runChunkByChunk(chunkX, chunkZ, entities, consumer));
+            synchronized (this) {
+                pending += batches.size();
+            }
+            ACTIVE_SUBTASKS.addAndGet(batches.size());
+            for (List<Map.Entry<Long, List<Entity>>> batch : batches) {
+                SUB_POOL.execute(() -> modzuozhi_runChunkBatch(batch, consumer));
             }
         }
 
-        /** 单区块组子任务：持本区块锁，组内实体串行 tick，单实体异常隔离。 */
-        private void modzuozhi_runChunkByChunk(int chunkX, int chunkZ, List<Entity> entities, Consumer<Entity> consumer) {
+        /**
+         * 一批区块组的子任务：组内（同区块）实体串行 tick，跨组并行；不再持 {@link ChunkLock}。
+         * 单实体异常隔离，异常计入 FaultGuard。
+         */
+        private void modzuozhi_runChunkBatch(List<Map.Entry<Long, List<Entity>>> batch, Consumer<Entity> consumer) {
             PostExecuteQueue prev = CURRENT_QUEUE.get();
             CURRENT_QUEUE.set(postQueue);
-            // 持本区块锁：与同区块的 TE/区块环境子任务互斥写同一区块的方块/实体容器
-            try (AutoCloseable chunkLock = ChunkLock.lock(chunkX, chunkZ)) {
-                for (Entity entity : entities) {
-                    try {
-                        if (!entity.isRemoved()) {
-                            consumer.accept(entity);
+            try {
+                for (Map.Entry<Long, List<Entity>> entry : batch) {
+                    for (Entity entity : entry.getValue()) {
+                        try {
+                            if (!entity.isRemoved()) {
+                                consumer.accept(entity);
+                            }
+                        } catch (Throwable t) {
+                            ModZuozhi.LOGGER.error("[FineGrain] 子任务异常", t);
+                            FaultGuard.onSubTaskFailure();
                         }
-                    } catch (Throwable t) {
-                        ModZuozhi.LOGGER.error("[FineGrain] 子任务异常", t);
-                        FaultGuard.onSubTaskFailure();
                     }
                 }
-            } catch (Exception ignore) {
-                // 区块锁释放异常：忽略（不影响实体 tick）
             } finally {
                 CURRENT_QUEUE.set(prev);
                 synchronized (this) {

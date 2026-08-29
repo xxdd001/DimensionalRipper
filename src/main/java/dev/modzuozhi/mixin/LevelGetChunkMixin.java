@@ -1,5 +1,7 @@
 package dev.modzuozhi.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ImposterProtoChunk;
@@ -7,7 +9,6 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Redirect;
 
 /**
  * 让 {@code Level.getChunk(int, int)} 对「区块未就绪」场景健壮。
@@ -24,14 +25,19 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * 这里在强转前，若结果是 {@code ImposterProtoChunk}，则取其 {@code getWrapped()}（其内部委托的真实
  * {@code LevelChunk}，其 {@code getBlockState}/{@code getSections} 均转发到 wrapped），既避免崩溃，
  * 语义也与原版一致。单线程场景该分支从不触发，是空操作。
+ * <p>
+ * 用 {@link WrapOperation} 而非 {@code @Redirect}，以便与其它模组对同一内部调用的
+ * {@code @Redirect}（如 Lithium 的 {@code world.chunk_access.LevelMixin}）共存：
+ * {@code @WrapOperation} 可与它们链式共存，不会因「merged by ... 无法注入」或互相跳过而崩。
+ * 保持默认优先级即可。性能等价：正常路径经 {@code original.call} 走原逻辑，仅多一次纳秒级间接调用。
  */
 @Mixin(Level.class)
 public abstract class LevelGetChunkMixin {
-    @Redirect(method = "getChunk(II)Lnet/minecraft/world/level/chunk/LevelChunk;",
+    @WrapOperation(method = "getChunk(II)Lnet/minecraft/world/level/chunk/LevelChunk;",
             at = @At(value = "INVOKE",
                     target = "Lnet/minecraft/world/level/Level;getChunk(IILnet/minecraft/world/level/chunk/status/ChunkStatus;)Lnet/minecraft/world/level/chunk/ChunkAccess;"))
-    private ChunkAccess modzuozhi_getRealChunk(Level level, int x, int z, ChunkStatus status) {
-        ChunkAccess chunk = level.getChunk(x, z, status);
+    private ChunkAccess modzuozhi_getRealChunk(Level level, int x, int z, ChunkStatus status, Operation<ChunkAccess> original) {
+        ChunkAccess chunk = original.call(level, x, z, status);
         if (chunk instanceof ImposterProtoChunk imposter) {
             return imposter.getWrapped();
         }

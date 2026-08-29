@@ -3,6 +3,8 @@ package dev.modzuozhi.mixin;
 import dev.modzuozhi.core.dimthread.DimThreadCore;
 import dev.modzuozhi.core.dimthread.FineGrainScheduler;
 import dev.modzuozhi.core.dimthread.PostExecuteQueue;
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import dev.modzuozhi.core.filter.SerDesFilter;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -14,7 +16,6 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.Collection;
@@ -71,15 +72,20 @@ public abstract class TickingBlockEntityParallelMixin {
         }
     }
 
-    @Redirect(method = "tickBlockEntities",
+    /**
+     * 用 {@link WrapOperation} 而非 {@code @Redirect} 包裹 {@code TickingBlockEntity.tick()} 调用，
+     * 以便与其它模组（如 Observable）对该调用点的 {@code @Redirect} 共存，避免「@Redirect conflict → 关键注入失败」启动崩溃。
+     * 性能等价：并行分支不调用 {@code original}，行为与原先一致。
+     */
+    @WrapOperation(method = "tickBlockEntities",
             at = @At(value = "INVOKE",
                     target = "Lnet/minecraft/world/level/block/entity/TickingBlockEntity;tick()V"))
-    private void modzuozhi_teTick(TickingBlockEntity ticker) {
+    private void modzuozhi_teTick(TickingBlockEntity ticker, Operation<Void> original) {
         if (this.modzuozhi_teParallel && SerDesFilter.INSTANCE.isParallel(ticker)) {
             MinecraftServer server = ((ServerLevel) (Object) this).getServer();
             this.modzuozhi_teBarrier.submit(server, ticker::tick, ticker.getPos());
         } else {
-            ticker.tick();
+            original.call(ticker);
         }
     }
 
