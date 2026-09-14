@@ -197,7 +197,9 @@ public class ServerManager {
      * 已在正确 loop 中的连接是 no-op，仅发生实际迁移时才增删。单机/少量玩家时开销可忽略。
      */
     public void reconcileConnections(MinecraftServer server) {
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+        // 快照拷贝：playerList.getPlayers() 返回不可变包装，高负载下（大量假人批量上线/下线）
+        // 原列表可能被并发修改 → 遍历报 ConcurrentModificationException。拷贝后迭代安全。
+        for (ServerPlayer player : new java.util.ArrayList<>(server.getPlayerList().getPlayers())) {
             if (player.connection != null) {
                 routeConnection(player.connection.getConnection(), player.serverLevel());
             }
